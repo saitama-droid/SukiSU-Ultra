@@ -6,7 +6,6 @@
 #include <linux/cred.h>
 #include "ss/policydb.h"
 #include "linux/key.h"
-#include <linux/list.h>
 
 /**
  * list_count_nodes - count the number of nodes in a list
