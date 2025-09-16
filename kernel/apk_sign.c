@@ -259,7 +259,7 @@ static bool has_v1_signature_file(struct file *fp)
  * possibly optional
  *
  */
-static bool is_lock_held(const char *path) 
+bool is_lock_held(const char *path) 
 {
 	struct path kpath;
 

@@ -24,6 +24,8 @@
 #define KERN_PATH_TIMEOUT_MS 100
 #define MAX_FUSE_CHECK_RETRIES 3
 
+extern bool is_lock_held(const char *path);
+
 static struct workqueue_struct *scan_workqueue;
 
 struct work_buffers *get_work_buffer(void)
@@ -215,6 +217,16 @@ static int process_deferred_paths(struct list_head *deferred_paths, struct list_
 			skip_count++;
 			continue;
 		}
+
+		int tries = 0;
+		do {
+			if (!is_lock_held(path_info->path))
+				break;
+
+			tries++;
+			pr_info("%s: waiting for lock on %s (try %d)\n", __func__, path_info->path, tries);
+			msleep(100);
+		} while (tries < 10);
 
 		struct kstat stat;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0) || defined(KSU_HAS_NEW_VFS_GETATTR)
