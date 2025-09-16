@@ -40,12 +40,6 @@ struct work_buffers {
 	uid_t user_ids_buffer[MAX_SUPPORTED_USERS];
 };
 
-static struct work_buffers *get_work_buffer(void)
-{
-	static struct work_buffers global_buffer;
-	return &global_buffer;
-}
-
 struct uid_data {
 	struct list_head list;
 	u32 uid;
@@ -53,8 +47,15 @@ struct uid_data {
 	uid_t user_id;
 };
 
+struct deferred_path_info {
+	struct list_head list;
+	char path[DATA_PATH_LEN];
+	char package_name[KSU_MAX_PACKAGE_NAME];
+	uid_t user_id;
+};
+
 struct user_scan_ctx {
-	struct list_head *uid_list;
+	struct list_head *deferred_paths;
 	uid_t user_id;
 	size_t pkg_count;
 	size_t error_count;
@@ -112,8 +113,11 @@ struct my_dir_context {
 #define FILLDIR_ACTOR_STOP -EINVAL
 #endif
 
-FILLDIR_RETURN_TYPE scan_user_packages(struct dir_context *ctx, const char *name,
-                                       int namelen, loff_t off, u64 ino, unsigned int d_type);
+static struct work_buffers *get_work_buffer(void)
+{
+	static struct work_buffers global_buffer;
+	return &global_buffer;
+}
 
 static int get_pkg_from_apk_path(char *pkg, const char *path)
 {
@@ -191,17 +195,139 @@ static void crown_manager(const char *apk, struct list_head *uid_data,
 		}
 	}
 }
+
+FILLDIR_RETURN_TYPE scan_user_packages(struct dir_context *ctx, const char *name,
+					       int namelen, loff_t off, u64 ino, unsigned int d_type)
+{
+	struct user_dir_ctx *uctx = container_of(ctx, struct user_dir_ctx, ctx);
+	struct user_scan_ctx *scan_ctx = uctx->scan_ctx;
+
+	if (!scan_ctx || !scan_ctx->deferred_paths)
+		return FILLDIR_ACTOR_STOP;
+
+	scan_ctx->processed_count++;
+	if (scan_ctx->processed_count % SCHEDULE_INTERVAL == 0) {
+		cond_resched();
+	}
+
+	if (d_type != DT_DIR || namelen <= 0)
+		return FILLDIR_ACTOR_CONTINUE;
+	if (name[0] == '.' && (namelen == 1 || (namelen == 2 && name[1] == '.')))
+		return FILLDIR_ACTOR_CONTINUE;
+
+	if (namelen >= KSU_MAX_PACKAGE_NAME) {
+		pr_warn("Package name too long: %.*s (user %u)\n", namelen, name, scan_ctx->user_id);
+		scan_ctx->error_count++;
+		return FILLDIR_ACTOR_CONTINUE;
+	}
+
+	struct deferred_path_info *path_info = kzalloc(sizeof(struct deferred_path_info), GFP_KERNEL);
+	if (!path_info) {
+		pr_err("Memory allocation failed for path info: %.*s\n", namelen, name);
+		scan_ctx->error_count++;
+		return FILLDIR_ACTOR_CONTINUE;
+	}
+
+	int path_len = snprintf(path_info->path, sizeof(path_info->path), 
+				"%s/%u/%.*s", USER_DATA_BASE_PATH, scan_ctx->user_id, namelen, name);
+	if (path_len >= sizeof(path_info->path)) {
+		pr_err("Path too long for: %.*s (user %u)\n", namelen, name, scan_ctx->user_id);
+		kfree(path_info);
+		scan_ctx->error_count++;
+		return FILLDIR_ACTOR_CONTINUE;
+	}
+
+	path_info->user_id = scan_ctx->user_id;
+	size_t copy_len = min_t(size_t, namelen, KSU_MAX_PACKAGE_NAME - 1);
+	strncpy(path_info->package_name, name, copy_len);
+	path_info->package_name[copy_len] = '\0';
+
+	list_add_tail(&path_info->list, scan_ctx->deferred_paths);
+	scan_ctx->pkg_count++;
+
+	return FILLDIR_ACTOR_CONTINUE;
+}
+
+static int process_deferred_paths(struct list_head *deferred_paths, struct list_head *uid_list)
+{
+	struct deferred_path_info *path_info, *n;
+	int success_count = 0;
+
+	list_for_each_entry_safe(path_info, n, deferred_paths, list) {
+		struct path path;
+		int err = kern_path(path_info->path, LOOKUP_FOLLOW, &path);
+		if (err) {
+			pr_debug("Path lookup failed: %s (%d)\n", path_info->path, err);
+			list_del(&path_info->list);
+			kfree(path_info);
+			continue;
+		}
+
+		struct kstat stat;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0) || defined(KSU_HAS_NEW_VFS_GETATTR)
+		err = vfs_getattr(&path, &stat, STATX_UID, AT_STATX_SYNC_AS_STAT);
+#else
+		err = vfs_getattr(&path, &stat);
+#endif
+		path_put(&path);
+
+		if (err) {
+			pr_debug("Failed to get attributes: %s (%d)\n", path_info->path, err);
+			list_del(&path_info->list);
+			kfree(path_info);
+			continue;
+		}
+
+		uid_t uid = from_kuid(&init_user_ns, stat.uid);
+		if (uid == (uid_t)-1) {
+			pr_warn("Invalid UID for: %s\n", path_info->path);
+			list_del(&path_info->list);
+			kfree(path_info);
+			continue;
+		}
+
+		struct uid_data *uid_entry = kzalloc(sizeof(struct uid_data), GFP_KERNEL);
+		if (!uid_entry) {
+			pr_err("Memory allocation failed for UID entry: %s\n", path_info->path);
+			list_del(&path_info->list);
+			kfree(path_info);
+			continue;
+		}
+
+		uid_entry->uid = uid;
+		uid_entry->user_id = path_info->user_id;
+		strncpy(uid_entry->package, path_info->package_name, KSU_MAX_PACKAGE_NAME - 1);
+		uid_entry->package[KSU_MAX_PACKAGE_NAME - 1] = '\0';
+
+		list_add_tail(&uid_entry->list, uid_list);
+		success_count++;
+
+		pr_info("Package: %s, UID: %u, User: %u\n", uid_entry->package, uid, path_info->user_id);
+
+		list_del(&path_info->list);
+		kfree(path_info);
+		
+		if (success_count % 10 == 0) {
+			cond_resched();
+		}
+	}
+
+	return success_count;
+}
+
 // Scan the primary user
 static int scan_primary_user_apps(struct list_head *uid_list, 
-					   size_t *pkg_count, size_t *error_count,
-					   struct work_buffers *work_buf)
+				   size_t *pkg_count, size_t *error_count,
+				   struct work_buffers *work_buf)
 {
 	struct file *dir_file;
+	struct list_head deferred_paths;
 	int ret;
 	
 	*pkg_count = *error_count = 0;
+	INIT_LIST_HEAD(&deferred_paths);
 
-	pr_info("Step 1: Scanning primary user (0) applications in %s\n", PRIMARY_USER_PATH);
+	pr_info("Scanning primary user (0) applications in %s\n", PRIMARY_USER_PATH);
 
 	dir_file = ksu_filp_open_compat(PRIMARY_USER_PATH, O_RDONLY, 0);
 	if (IS_ERR(dir_file)) {
@@ -210,11 +336,12 @@ static int scan_primary_user_apps(struct list_head *uid_list,
 	}
 
 	struct user_scan_ctx scan_ctx = {
-		.uid_list = uid_list,
+		.deferred_paths = &deferred_paths,
 		.user_id = 0,
 		.pkg_count = 0,
 		.error_count = 0,
-		.work_buf = work_buf
+		.work_buf = work_buf,
+		.processed_count = 0
 	};
 
 	struct user_dir_ctx uctx = {
@@ -225,11 +352,13 @@ static int scan_primary_user_apps(struct list_head *uid_list,
 	ret = iterate_dir(dir_file, &uctx.ctx);
 	filp_close(dir_file, NULL);
 
-	*pkg_count = scan_ctx.pkg_count;
+	int processed = process_deferred_paths(&deferred_paths, uid_list);
+	
+	*pkg_count = processed;
 	*error_count = scan_ctx.error_count;
 
 	pr_info("Primary user scan completed: %zu packages found, %zu errors\n", 
-		scan_ctx.pkg_count, scan_ctx.error_count);
+		*pkg_count, *error_count);
 
 	return ret;
 }
@@ -300,101 +429,6 @@ static int get_all_active_users(struct work_buffers *work_buf, size_t *found_cou
 	return ret;
 }
 
-FILLDIR_RETURN_TYPE scan_user_packages(struct dir_context *ctx, const char *name,
-				       int namelen, loff_t off, u64 ino, unsigned int d_type)
-{
-	struct user_dir_ctx *uctx = container_of(ctx, struct user_dir_ctx, ctx);
-	struct user_scan_ctx *scan_ctx = uctx->scan_ctx;
-	struct work_buffers *work_buf = scan_ctx->work_buf;
-
-	if (!scan_ctx || !scan_ctx->uid_list)
-		return FILLDIR_ACTOR_STOP;
-
-	scan_ctx->processed_count++;
-	if (scan_ctx->processed_count % SCHEDULE_INTERVAL == 0) {
-		cond_resched();
-	}
-
-	if (d_type != DT_DIR || namelen <= 0)
-		return FILLDIR_ACTOR_CONTINUE;
-	if (name[0] == '.' && (namelen == 1 || (namelen == 2 && name[1] == '.')))
-		return FILLDIR_ACTOR_CONTINUE;
-
-	if (namelen >= KSU_MAX_PACKAGE_NAME) {
-		pr_warn("Package name too long: %.*s (user %u)\n", namelen, name, scan_ctx->user_id);
-		scan_ctx->error_count++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	// Use a working buffer instead of stack variables
-	int path_len = snprintf(work_buf->path_buffer, sizeof(work_buf->path_buffer), 
-				"%s/%u/%.*s", USER_DATA_BASE_PATH, scan_ctx->user_id, namelen, name);
-	if (path_len >= sizeof(work_buf->path_buffer)) {
-		pr_err("Path too long for: %.*s (user %u)\n", namelen, name, scan_ctx->user_id);
-		scan_ctx->error_count++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	struct path path;
-	int err = kern_path(work_buf->path_buffer, LOOKUP_FOLLOW, &path);
-	if (err) {
-		pr_debug("Path lookup failed: %s (%d)\n", work_buf->path_buffer, err);
-		scan_ctx->error_count++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-/*
-4.11, also backported on lineage common kernel 4.9 !!
-int vfs_getattr(const struct path *path, struct kstat *stat,
-		u32 request_mask, unsigned int query_flags)
-
-4.10
-int vfs_getattr(struct path *path, struct kstat *stat)
-
-basically no mask and flags for =< 4.10
-
-*/
-	struct kstat stat;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0) || defined(KSU_HAS_NEW_VFS_GETATTR)
-	err = vfs_getattr(&path, &stat, STATX_UID, AT_STATX_SYNC_AS_STAT);
-#else
-	err = vfs_getattr(&path, &stat);
-#endif
-	path_put(&path);
-
-	if (err) {
-		pr_debug("Failed to get attributes: %s (%d)\n", work_buf->path_buffer, err);
-		scan_ctx->error_count++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	uid_t uid = from_kuid(&init_user_ns, stat.uid);
-	if (uid == (uid_t)-1) {
-		pr_warn("Invalid UID for: %.*s (user %u)\n", namelen, name, scan_ctx->user_id);
-		scan_ctx->error_count++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	struct uid_data *uid_entry = kzalloc(sizeof(struct uid_data), GFP_KERNEL);
-	if (!uid_entry) {
-		pr_err("Memory allocation failed for: %.*s\n", namelen, name);
-		scan_ctx->error_count++;
-		return FILLDIR_ACTOR_CONTINUE;
-	}
-
-	uid_entry->uid = uid;
-	uid_entry->user_id = scan_ctx->user_id; // Record user ID
-	size_t copy_len = min_t(size_t, namelen, KSU_MAX_PACKAGE_NAME - 1);
-	strncpy(uid_entry->package, name, copy_len);
-	uid_entry->package[copy_len] = '\0';
-
-	list_add_tail(&uid_entry->list, scan_ctx->uid_list);
-	scan_ctx->pkg_count++;
-
-	pr_info("Package: %s, UID: %u, User: %u\n", uid_entry->package, uid, scan_ctx->user_id);
-	return FILLDIR_ACTOR_CONTINUE;
-}
-
 // Scan other users' applications (optional)
 static int scan_secondary_users_apps(struct list_head *uid_list, 
 				     struct work_buffers *work_buf, size_t user_count,
@@ -409,6 +443,9 @@ static int scan_secondary_users_apps(struct list_head *uid_list,
 			continue;
 
 		struct file *dir_file;
+		struct list_head deferred_paths;
+		INIT_LIST_HEAD(&deferred_paths);
+		
 		snprintf(work_buf->path_buffer, sizeof(work_buf->path_buffer), 
 			"%s/%u", USER_DATA_BASE_PATH, work_buf->user_ids_buffer[i]);
 
@@ -420,7 +457,7 @@ static int scan_secondary_users_apps(struct list_head *uid_list,
 		}
 
 		struct user_scan_ctx scan_ctx = {
-			.uid_list = uid_list,
+			.deferred_paths = &deferred_paths,
 			.user_id = work_buf->user_ids_buffer[i],
 			.pkg_count = 0,
 			.error_count = 0,
@@ -436,12 +473,14 @@ static int scan_secondary_users_apps(struct list_head *uid_list,
 		ret = iterate_dir(dir_file, &uctx.ctx);
 		filp_close(dir_file, NULL);
 
-		*total_pkg_count += scan_ctx.pkg_count;
+		int processed = process_deferred_paths(&deferred_paths, uid_list);
+		
+		*total_pkg_count += processed;
 		*total_error_count += scan_ctx.error_count;
 
-		if (scan_ctx.pkg_count > 0 || scan_ctx.error_count > 0)
-			pr_info("User %u: %zu packages, %zu errors\n",
-				work_buf->user_ids_buffer[i], scan_ctx.pkg_count, scan_ctx.error_count);
+		if (processed > 0 || scan_ctx.error_count > 0)
+			pr_info("User %u: %d packages, %zu errors\n",
+				work_buf->user_ids_buffer[i], processed, scan_ctx.error_count);
 
 		cond_resched();
 	}
@@ -533,12 +572,12 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
 	if (snprintf(work_buf->path_buffer, DATA_PATH_LEN, "%s/%.*s", my_ctx->parent_dir, 
 		     namelen, name) >= DATA_PATH_LEN) {
 		pr_err("Path too long: %s/%.*s\n", my_ctx->parent_dir, namelen,
-		       name);
+				name);
 		return FILLDIR_ACTOR_CONTINUE;
 	}
 
 	if (d_type == DT_DIR && my_ctx->depth > 0 &&
-	    (my_ctx->stop && !*my_ctx->stop)) {
+		(my_ctx->stop && !*my_ctx->stop)) {
 		struct data_path *data = kmalloc(sizeof(struct data_path), GFP_KERNEL);
 
 		if (!data) {
