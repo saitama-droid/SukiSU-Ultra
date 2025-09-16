@@ -15,6 +15,8 @@
 #include <linux/completion.h>
 #include <linux/atomic.h>
 #include <linux/mutex.h>
+#include <linux/preempt.h>
+#include <linux/hardirq.h>
 
 #include "klog.h"
 #include "ksu.h"
@@ -23,6 +25,14 @@
 
 #define KERN_PATH_TIMEOUT_MS 100
 #define MAX_FUSE_CHECK_RETRIES 3
+
+//  Magic Number: File System Superblock Identifier
+#define FUSE_SUPER_MAGIC      0x65735546  // FUSE (Userspace filesystem)
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630  // OverlayFS
+#define TMPFS_MAGIC           0x01021994  // tmpfs
+#define F2FS_SUPER_MAGIC      0xF2F52010  // F2FS (Flash-Friendly File System)
+#define EXT4_SUPER_MAGIC      0xEF53      // ext4
+
 
 extern bool is_lock_held(const char *path);
 
@@ -38,13 +48,32 @@ struct work_buffers *get_work_buffer(void)
 static bool is_dangerous_fs_magic(unsigned long magic)
 {
 	switch (magic) {
-	case 0x65735546:
-	case 0x794c7630:
-	case 0x01021994:
+	case FUSE_SUPER_MAGIC:
+	case OVERLAYFS_SUPER_MAGIC:
+	case TMPFS_MAGIC:
+	case F2FS_SUPER_MAGIC:
+	case EXT4_SUPER_MAGIC:
 		return true;
 	default:
 		return false;
 	}
+}
+
+// Check whether the file system is an encrypted user data file system
+static bool is_encrypted_userdata_fs(struct super_block *sb, const char *path)
+{
+	if (!sb || !path)
+		return true;
+		
+	if (strstr(path, "/data/user_de") || strstr(path, "/data/user")) {
+		return true;
+	}
+	
+	if (is_dangerous_fs_magic(sb->s_magic)) {
+		return true;
+	}
+	
+	return false;
 }
 
 static bool is_path_for_kern_path(const char *path, struct super_block *expected_sb)
@@ -60,9 +89,8 @@ static bool is_path_for_kern_path(const char *path, struct super_block *expected
 			return false;
 	}
 
-	if (expected_sb && is_dangerous_fs_magic(expected_sb->s_magic)) {
-		pr_info("Skipping dangerous filesystem (magic=0x%lx): %s\n", 
-			expected_sb->s_magic, path);
+	if (in_interrupt() || in_atomic()) {
+		pr_warn("Cannot scan path in atomic context: %s\n", path);
 		return false;
 	}
 
@@ -70,20 +98,39 @@ static bool is_path_for_kern_path(const char *path, struct super_block *expected
 		return false;
 	}
 
-	if (strstr(path, ".tmp") || strstr(path, ".removing") || strstr(path, ".unmounting")) {
+	if (strstr(path, ".tmp") || strstr(path, ".removing") || 
+	    strstr(path, ".unmounting") || strstr(path, ".pending")) {
 		pr_debug("Path appears to be in transition state: %s\n", path);
 		return false;
+	}
+
+	if (expected_sb) {
+		if (is_dangerous_fs_magic(expected_sb->s_magic)) {
+			pr_info("Skipping dangerous filesystem (magic=0x%lx): %s\n", 
+				expected_sb->s_magic, path);
+			return false;
+		}
+		
+		if (is_encrypted_userdata_fs(expected_sb, path)) {
+			pr_warn("Skipping potentially encrypted userdata filesystem: %s\n", path);
+			return false;
+		}
 	}
 
 	return true;
 }
 
-static int kern_path_with_timeout(const char *path, unsigned int flags, struct path *result)
+static int kern_path_with_timeout(const char *path, unsigned int flags, 
+					      struct path *result)
 {
 	unsigned long start_time = jiffies;
 	unsigned long timeout = start_time + msecs_to_jiffies(KERN_PATH_TIMEOUT_MS);
 	int retries = 0;
 	int err;
+
+	if (!is_path_for_kern_path(path, NULL)) {
+		return -EPERM;
+	}
 
 	do {
 		if (time_after(jiffies, timeout)) {
@@ -96,13 +143,22 @@ static int kern_path_with_timeout(const char *path, unsigned int flags, struct p
 			return -EINTR;
 		}
 
+		if (in_atomic() || irqs_disabled()) {
+			pr_warn("Cannot call kern_path in atomic context: %s\n", path);
+			return -EINVAL;
+		}
+
 		err = kern_path(path, flags, result);
 		
 		if (err == 0) {
+			if (!is_path_for_kern_path(path, result->mnt->mnt_sb)) {
+				path_put(result);
+				return -EPERM;
+			}
 			return 0;
 		}
 
-		if (err == -ENOENT || err == -ENOTDIR || err == -EACCES) {
+		if (err == -ENOENT || err == -ENOTDIR || err == -EACCES || err == -EPERM) {
 			return err;
 		}
 
@@ -199,7 +255,7 @@ static int process_deferred_paths(struct list_head *deferred_paths, struct list_
 		struct path path;
 		int err = kern_path_with_timeout(path_info->path, LOOKUP_FOLLOW, &path);
 		if (err) {
-			if (err != -ENOENT) {
+			if (err != -ENOENT && err != -EPERM) {
 				pr_debug("Path lookup failed: %s (%d)\n", path_info->path, err);
 			}
 			list_del(&path_info->list);
@@ -207,17 +263,7 @@ static int process_deferred_paths(struct list_head *deferred_paths, struct list_
 			continue;
 		}
 
-		// Check the file system type
-		if (is_dangerous_fs_magic(path.mnt->mnt_sb->s_magic)) {
-			pr_info("Skipping path on dangerous filesystem: %s (magic=0x%lx)\n", 
-				path_info->path, path.mnt->mnt_sb->s_magic);
-			path_put(&path);
-			list_del(&path_info->list);
-			kfree(path_info);
-			skip_count++;
-			continue;
-		}
-
+		// Check lock status
 		int tries = 0;
 		do {
 			if (!is_lock_held(path_info->path))
@@ -307,10 +353,9 @@ static int scan_primary_user_apps(struct list_head *uid_list,
 		return PTR_ERR(dir_file);
 	}
 
-	// Check the file system type
-	if (is_dangerous_fs_magic(dir_file->f_inode->i_sb->s_magic)) {
-		pr_err("Primary user path is on dangerous filesystem (magic=0x%lx), aborting\n",
-		       dir_file->f_inode->i_sb->s_magic);
+	// Check file system security
+	if (!is_path_for_kern_path(PRIMARY_USER_PATH, dir_file->f_inode->i_sb)) {
+		pr_err("Primary user path is not safe for scanning, aborting\n");
 		filp_close(dir_file, NULL);
 		return -EOPNOTSUPP;
 	}
@@ -388,11 +433,12 @@ static int get_all_active_users(struct work_buffers *work_buf, size_t *found_cou
 	}
 
 	// Check the file system type of the base path
-	if (is_dangerous_fs_magic(dir_file->f_inode->i_sb->s_magic)) {
-		pr_err("User data base path is on dangerous filesystem (magic=0x%lx), aborting\n",
-		       dir_file->f_inode->i_sb->s_magic);
+	if (!is_path_for_kern_path(USER_DATA_BASE_PATH, dir_file->f_inode->i_sb)) {
+		pr_warn("User data base path is not safe for scanning, using primary user only\n");
 		filp_close(dir_file, NULL);
-		return -EOPNOTSUPP;
+		work_buf->user_ids_buffer[0] = 0;
+		*found_count = 1;
+		return 0;
 	}
 
 	struct user_id_ctx uctx = {
@@ -437,10 +483,9 @@ static void scan_user_worker(struct work_struct *work)
 		goto done;
 	}
 
-	// Check the file system type of the user directory
-	if (is_dangerous_fs_magic(dir_file->f_inode->i_sb->s_magic)) {
-		pr_info("User path %s is on dangerous filesystem (magic=0x%lx), skipping\n",
-			path_buffer, dir_file->f_inode->i_sb->s_magic);
+	// Check User Directory Security
+	if (!is_path_for_kern_path(path_buffer, dir_file->f_inode->i_sb)) {
+		pr_warn("User path %s is not safe for scanning, skipping\n", path_buffer);
 		filp_close(dir_file, NULL);
 		goto done;
 	}
@@ -500,7 +545,7 @@ static int scan_secondary_users_apps(struct list_head *uid_list,
 	}
 
 	for (size_t i = 0; i < user_count; i++) {
-		// Skip the main user since it was already scanned in the first step
+		// Skip the main user since it has already been scanned.
 		if (work_buf->user_ids_buffer[i] == 0)
 			continue;
 
@@ -544,6 +589,11 @@ int scan_user_data_for_uids(struct list_head *uid_list, bool scan_all_users)
 	if (!uid_list)
 		return -EINVAL;
 
+	if (in_interrupt() || in_atomic()) {
+		pr_err("Cannot scan user data in atomic context\n");
+		return -EINVAL;
+	}
+
 	struct work_buffers *work_buf = get_work_buffer();
 	if (!work_buf) {
 		pr_err("Failed to get work buffer\n");
@@ -569,7 +619,7 @@ int scan_user_data_for_uids(struct list_head *uid_list, bool scan_all_users)
 	size_t active_users;
 	ret = get_all_active_users(work_buf, &active_users);
 	if (ret < 0 || active_users == 0) {
-		pr_warn("Failed to get active users, using primary user only: %d\n", ret);
+		pr_warn("Failed to get active users or no additional users found, using primary user only: %d\n", ret);
 		return primary_pkg_count > 0 ? 0 : -ENOENT;
 	}
 
