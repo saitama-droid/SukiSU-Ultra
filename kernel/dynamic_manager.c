@@ -38,6 +38,7 @@ static DEFINE_SPINLOCK(dynamic_manager_lock);
 static struct work_struct save_dynamic_manager_work;
 static struct work_struct load_dynamic_manager_work;
 static struct work_struct clear_dynamic_manager_work;
+static struct work_struct rescan_managers_work;
 
 bool ksu_is_dynamic_manager_enabled(void)
 {
@@ -162,7 +163,7 @@ int ksu_get_manager_signature_index(uid_t uid)
     return signature_index;
 }
 
-static void clear_dynamic_manager(void)
+static void clear_dynamic_managers(void)
 {
     unsigned long flags;
     int i;
@@ -178,6 +179,20 @@ static void clear_dynamic_manager(void)
     }
     
     spin_unlock_irqrestore(&managers_lock, flags);
+}
+
+static void do_rescan_managers(struct work_struct *work)
+{
+    pr_info("Starting manager rescan after configuration change\n");
+    
+    // Clear existing dynamic managers
+    clear_dynamic_managers();
+    
+    // Trigger throne tracker to search for new managers
+    extern void track_throne(void);
+    track_throne();
+    
+    pr_info("Manager rescan completed\n");
 }
 
 int ksu_get_active_managers(struct manager_list_info *info)
@@ -369,6 +384,11 @@ static bool clear_dynamic_manager_file(void)
     return ksu_queue_work(&clear_dynamic_manager_work);
 }
 
+static bool trigger_manager_rescan(void)
+{
+    return ksu_queue_work(&rescan_managers_work);
+}
+
 int ksu_handle_dynamic_manager(struct dynamic_manager_user_config *config)
 {
     unsigned long flags;
@@ -400,6 +420,16 @@ int ksu_handle_dynamic_manager(struct dynamic_manager_user_config *config)
             }
         }
         
+        if (ksu_is_dynamic_manager_enabled()) {
+            pr_info("Clearing existing dynamic managers before applying new configuration\n");
+            clear_dynamic_managers();
+            
+            if (ksu_manager_uid != KSU_INVALID_UID) {
+                pr_info("Invalidating current traditional manager for reconfiguration\n");
+                ksu_invalidate_manager_uid();
+            }
+        }
+        
         spin_lock_irqsave(&dynamic_manager_lock, flags);
         dynamic_manager.size = config->size;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
@@ -411,8 +441,13 @@ int ksu_handle_dynamic_manager(struct dynamic_manager_user_config *config)
         spin_unlock_irqrestore(&dynamic_manager_lock, flags);
         
         persistent_dynamic_manager();
+        
         pr_info("dynamic manager updated: size=0x%x, hash=%.16s... (multi-manager enabled)\n", 
                 config->size, config->hash);
+        
+        pr_info("Triggering immediate manager rescan\n");
+        trigger_manager_rescan();
+        
         break;
         
     case DYNAMIC_MANAGER_OP_GET:
@@ -439,7 +474,7 @@ int ksu_handle_dynamic_manager(struct dynamic_manager_user_config *config)
         spin_unlock_irqrestore(&dynamic_manager_lock, flags);
         
         // Clear only dynamic managers, preserve default manager
-        clear_dynamic_manager();
+        clear_dynamic_managers();
         
         // Clear file using the same method as save
         clear_dynamic_manager_file();
@@ -455,6 +490,40 @@ int ksu_handle_dynamic_manager(struct dynamic_manager_user_config *config)
     return ret;
 }
 
+bool ksu_validate_dynamic_managers(void)
+{
+    unsigned long flags;
+    bool changed = false;
+    int i;
+    
+    if (!ksu_is_dynamic_manager_enabled()) {
+        return false;
+    }
+    
+    spin_lock_irqsave(&managers_lock, flags);
+    
+    for (i = 0; i < MAX_MANAGERS; i++) {
+        if (active_managers[i].is_active) {
+            char package_path[256];
+            snprintf(package_path, sizeof(package_path), "/data/data/uid_%d", active_managers[i].uid);
+            
+            struct file *fp = ksu_filp_open_compat(package_path, O_RDONLY, 0);
+            if (IS_ERR(fp)) {
+                pr_info("Dynamic manager uid=%d appears to be uninstalled, removing\n", 
+                        active_managers[i].uid);
+                active_managers[i].is_active = false;
+                changed = true;
+            } else {
+                filp_close(fp, 0);
+            }
+        }
+    }
+    
+    spin_unlock_irqrestore(&managers_lock, flags);
+    
+    return changed;
+}
+
 bool ksu_load_dynamic_manager(void)
 {
     return ksu_queue_work(&load_dynamic_manager_work);
@@ -467,6 +536,7 @@ void ksu_dynamic_manager_init(void)
     INIT_WORK(&save_dynamic_manager_work, do_save_dynamic_manager);
     INIT_WORK(&load_dynamic_manager_work, do_load_dynamic_manager);
     INIT_WORK(&clear_dynamic_manager_work, do_clear_dynamic_manager);
+    INIT_WORK(&rescan_managers_work, do_rescan_managers);
     
     // Initialize manager slots
     for (i = 0; i < MAX_MANAGERS; i++) {
@@ -480,7 +550,7 @@ void ksu_dynamic_manager_init(void)
 
 void ksu_dynamic_manager_exit(void)
 {
-    clear_dynamic_manager();
+    clear_dynamic_managers();
     
     // Save current config before exit
     do_save_dynamic_manager(NULL);

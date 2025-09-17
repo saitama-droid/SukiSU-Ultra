@@ -48,4 +48,6 @@ int ksu_get_active_managers(struct manager_list_info *info);
 // Configuration access for signature verification
 bool ksu_get_dynamic_manager_config(unsigned int *size, const char **hash);
 
+bool ksu_validate_dynamic_managers(void);
+
 #endif

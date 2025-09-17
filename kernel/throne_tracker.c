@@ -544,6 +544,7 @@ void track_throne(void)
 	// first, check if manager_uid exist!
 	bool manager_exist = false;
 	bool dynamic_manager_exist = false;
+		bool dynamic_managers_changed = false;
 	
 	list_for_each_entry (np, &uid_list, list) {
 		// if manager is installed in work profile, the uid in packages.list is still equals main profile
@@ -554,15 +555,21 @@ void track_throne(void)
 			break;
 		}
 	}
-	
+
 	// Check for dynamic managers
-	if (!dynamic_manager_exist && ksu_is_dynamic_manager_enabled()) {
+	if (ksu_is_dynamic_manager_enabled()) {
+		dynamic_managers_changed = ksu_validate_dynamic_managers();
+		
 		list_for_each_entry (np, &uid_list, list) {
 			// Check if this uid is a dynamic manager (not the traditional manager)
 			if (ksu_is_any_manager(np->uid) && np->uid != ksu_get_manager_uid()) {
 				dynamic_manager_exist = true;
 				break;
 			}
+		}
+		
+		if (dynamic_managers_changed) {
+			pr_info("Some dynamic managers were invalidated due to app uninstallation\n");
 		}
 	}
 
