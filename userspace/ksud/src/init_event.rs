@@ -7,7 +7,7 @@ use log::{info, warn};
 use rustix::fs::{MountFlags, mount};
 use std::path::Path;
 
-pub fn on_post_data_fs() -> Result<()> {
+pub fn on_post_data_fs(all_users: bool) -> Result<()> {
     ksucalls::report_post_fs_data();
 
     utils::umask(0);
@@ -38,7 +38,7 @@ pub fn on_post_data_fs() -> Result<()> {
     // tell kernel that we've mount the module, so that it can do some optimization
     ksucalls::report_module_mounted();
 
-    start_uid_scanner()?;
+    start_uid_scanner(all_users)?;
     // if we are in safe mode, we should disable all modules
     if safe_mode {
         warn!("safe mode, skip post-fs-data scripts and disable all modules!");
@@ -114,9 +114,9 @@ pub fn on_post_data_fs() -> Result<()> {
     Ok(())
 }
 
-fn start_uid_scanner() -> Result<()> {
+fn start_uid_scanner(all_users: bool) -> Result<()> {
     info!("Starting UID scanner daemon");
-    user_id_scanner::start_uid_scanner()
+    user_id_scanner::start_uid_scanner(all_users)
 }
 
 #[cfg(target_os = "android")]

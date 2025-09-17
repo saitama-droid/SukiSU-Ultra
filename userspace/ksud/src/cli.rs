@@ -30,7 +30,11 @@ enum Commands {
     },
 
     /// Trigger `post-fs-data` event
-    PostFsData,
+    PostFsData {
+        /// Scan all user IDs instead of just the main user (user 0)
+        #[arg(long, default_value = "false")]
+        all_users: bool,
+    },
 
     /// Trigger `service` event
     Services,
@@ -129,9 +133,9 @@ enum Commands {
     },
 
     /// UID Scanner Management
-    UidScanner {
+    Scanner {
         #[command(subcommand)]
-        command: UidScanner,
+        command: Scanner,
     },
 }
 
@@ -176,9 +180,58 @@ enum Debug {
 }
 
 #[derive(clap::Subcommand, Debug)]
-enum UidScanner {
-    /// Manually trigger UID scan
-    Trigger,
+enum Scanner {
+    /// Start UID scanner daemon
+    Start {
+        /// Scan all users instead of just root user
+        #[arg(short, long, default_value = "false")]
+        all_users: bool,
+        /// Use custom configuration file
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Stop UID scanner daemon
+    Stop,
+
+    /// Trigger manual UID scan
+    Scan {
+        /// Scan all users instead of just root user
+        #[arg(short, long, default_value = "false")]
+        all_users: bool,
+    },
+
+    /// Show scanner status
+    Status,
+
+    /// Configure scanner settings
+    Config {
+        #[command(subcommand)]
+        command: ScannerConfig,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ScannerConfig {
+    /// Get current configuration
+    Get {
+        /// Specific config key to retrieve
+        key: Option<String>,
+    },
+
+    /// Set configuration value
+    Set {
+        /// Configuration key
+        key: String,
+        /// Configuration value
+        value: String,
+    },
+
+    /// Reset configuration to default
+    Reset,
+
+    /// Show configuration file path
+    Path,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -310,7 +363,7 @@ pub fn run() -> Result<()> {
     log::info!("command: {:?}", cli.command);
 
     let result = match cli.command {
-        Commands::PostFsData => init_event::on_post_data_fs(),
+        Commands::PostFsData { all_users } => init_event::on_post_data_fs(all_users),
         Commands::BootCompleted => init_event::on_boot_completed(),
 
         Commands::Module { command } => {
@@ -363,11 +416,50 @@ pub fn run() -> Result<()> {
             Debug::Test => assets::ensure_binaries(false),
         },
 
-        Commands::UidScanner { command } => match command {
-            UidScanner::Trigger => {
-                user_id_scanner::trigger_uid_scan()?;
-                println!("UID Scan triggered");
+        Commands::Scanner { command } => match command {
+            Scanner::Start { all_users, config } => {
+                user_id_scanner::start_scanner_daemon(all_users, config)?;
+                println!("UID scanner daemon started successfully");
                 Ok(())
+            }
+            Scanner::Stop => {
+                user_id_scanner::stop_scanner_daemon()?;
+                println!("UID scanner daemon stopped");
+                Ok(())
+            }
+            Scanner::Scan { all_users } => {
+                user_id_scanner::trigger_manual_scan(all_users)?;
+                println!(
+                    "Manual UID scan completed ({})",
+                    if all_users { "all users" } else { "root user only" }
+                );
+                Ok(())
+            }
+            Scanner::Status => {
+                let status = user_id_scanner::get_scanner_status()?;
+                println!("Scanner Status: {}", status);
+                Ok(())
+            }
+            Scanner::Config { command } => match command {
+                ScannerConfig::Get { key } => {
+                    user_id_scanner::get_config(key)?;
+                    Ok(())
+                }
+                ScannerConfig::Set { key, value } => {
+                    user_id_scanner::set_config(key, value)?;
+                    println!("Configuration updated successfully");
+                    Ok(())
+                }
+                ScannerConfig::Reset => {
+                    user_id_scanner::reset_config()?;
+                    println!("Configuration reset to default values");
+                    Ok(())
+                }
+                ScannerConfig::Path => {
+                    let path = user_id_scanner::get_config_path();
+                    println!("Configuration file: {}", path.display());
+                    Ok(())
+                }
             }
         },
 
