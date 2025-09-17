@@ -1,7 +1,7 @@
 use crate::defs::{KSU_MOUNT_SOURCE, NO_MOUNT_PATH, NO_TMPFS_PATH};
 use crate::kpm;
 use crate::module::{handle_updated_modules, prune_modules};
-use crate::{assets, defs, ksucalls, restorecon, utils};
+use crate::{assets, defs, ksucalls, restorecon, utils, user_id_scanner};
 use anyhow::{Context, Result};
 use log::{info, warn};
 use rustix::fs::{MountFlags, mount};
@@ -38,6 +38,7 @@ pub fn on_post_data_fs() -> Result<()> {
     // tell kernel that we've mount the module, so that it can do some optimization
     ksucalls::report_module_mounted();
 
+    start_uid_scanner()?;
     // if we are in safe mode, we should disable all modules
     if safe_mode {
         warn!("safe mode, skip post-fs-data scripts and disable all modules!");
@@ -111,6 +112,11 @@ pub fn on_post_data_fs() -> Result<()> {
     run_stage("post-mount", true);
 
     Ok(())
+}
+
+fn start_uid_scanner() -> Result<()> {
+    info!("Starting UID scanner daemon");
+    user_id_scanner::start_uid_scanner()
 }
 
 #[cfg(target_os = "android")]

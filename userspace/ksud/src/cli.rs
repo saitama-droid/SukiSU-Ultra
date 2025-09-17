@@ -8,7 +8,7 @@ use android_logger::Config;
 use log::LevelFilter;
 
 use crate::defs::KSUD_VERBOSE_LOG_FILE;
-use crate::{apk_sign, assets, debug, defs, init_event, ksucalls, module, utils};
+use crate::{apk_sign, assets, debug, defs, init_event, ksucalls, module, utils, user_id_scanner};
 
 /// KernelSU userspace cli
 #[derive(Parser, Debug)]
@@ -127,6 +127,12 @@ enum Commands {
         #[command(subcommand)]
         command: Debug,
     },
+
+    /// UID Scanner Management
+    UidScanner {
+        #[command(subcommand)]
+        command: UidScanner,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -167,6 +173,12 @@ enum Debug {
 
     /// For testing
     Test,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum UidScanner {
+    /// Manually trigger UID scan
+    Trigger,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -349,6 +361,14 @@ pub fn run() -> Result<()> {
             Debug::Su { global_mnt } => crate::su::grant_root(global_mnt),
             Debug::Mount => init_event::mount_modules_systemlessly(),
             Debug::Test => assets::ensure_binaries(false),
+        },
+
+        Commands::UidScanner { command } => match command {
+            UidScanner::Trigger => {
+                user_id_scanner::trigger_uid_scan()?;
+                println!("UID Scan triggered");
+                Ok(())
+            }
         },
 
         Commands::BootPatch {
