@@ -24,6 +24,8 @@
 #define CMD_IS_SU_ENABLED 14
 #define CMD_ENABLE_SU 15
 
+#define CMD_UPDATE_UID_LIST 50
+
 #define CMD_GET_FULL_VERSION 0xC0FFEE1A
 
 #define CMD_ENABLE_KPM 100
@@ -51,6 +53,8 @@
 #define DYNAMIC_MANAGER_OP_GET 1
 #define DYNAMIC_MANAGER_OP_CLEAR 2
 
+#define KSU_MAX_UID_ENTRIES 4096
+
 struct dynamic_manager_user_config {
     unsigned int operation;
     unsigned int size;
@@ -63,6 +67,16 @@ struct manager_list_info {
         uid_t uid;
         int signature_index;
     } managers[2];
+};
+
+struct uid_package_entry {
+    u32 uid;
+    char package[KSU_MAX_PACKAGE_NAME];
+};
+
+struct uid_list_data {
+    u32 count;
+    struct uid_package_entry *entries;
 };
 
 struct root_profile {

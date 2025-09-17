@@ -345,6 +345,57 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 		return 0;
 	}
 
+	if (arg2 == CMD_UPDATE_UID_LIST) {
+		if (!from_root) {
+			return 0;
+		}
+		
+		struct uid_list_data *uid_data = NULL;
+		u32 count;
+		
+		if (copy_from_user(&count, (void __user *)arg3, sizeof(count))) {
+			pr_err("update_uid_list: copy count failed\n");
+			return 0;
+		}
+		
+		if (count > KSU_MAX_UID_ENTRIES) {
+			pr_err("update_uid_list: too many entries: %u\n", count);
+			return 0;
+		}
+		
+		size_t data_size = sizeof(struct uid_list_data) + 
+				   count * sizeof(struct uid_package_entry);
+		uid_data = kzalloc(data_size, GFP_KERNEL);
+		if (!uid_data) {
+			pr_err("update_uid_list: failed to allocate memory\n");
+			return 0;
+		}
+		
+		uid_data->count = count;
+		uid_data->entries = (struct uid_package_entry *)(uid_data + 1);
+		
+		if (copy_from_user(uid_data->entries, 
+				   (void __user *)arg3 + sizeof(u32),
+				   count * sizeof(struct uid_package_entry))) {
+			pr_err("update_uid_list: copy_from_user failed\n");
+			kfree(uid_data);
+			return 0;
+		}
+		
+		int ret = ksu_update_uid_list(uid_data);
+		if (ret == 0) {
+			if (copy_to_user(result, &reply_ok, sizeof(reply_ok))) {
+				pr_err("update_uid_list: prctl reply error\n");
+			}
+			pr_info("Successfully updated UID list with %u entries\n", uid_data->count);
+		} else {
+			pr_err("Failed to update UID list: %d\n", ret);
+		}
+		
+		kfree(uid_data);
+		return 0;
+	}
+
 	// Allow the root manager to configure dynamic manageratures
 	if (arg2 == CMD_DYNAMIC_MANAGER) {
     	if (!from_root && !from_manager) {
@@ -1033,3 +1084,5 @@ void ksu_core_exit(void)
 	// ksu_kprobe_exit();
 #endif
 }
+
+	
