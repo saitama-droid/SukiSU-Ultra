@@ -18,6 +18,8 @@
 #include "throne_comm.h"
 
 uid_t ksu_manager_uid = KSU_INVALID_UID;
+static uid_t locked_manager_uid = KSU_INVALID_UID;
+static uid_t locked_dynamic_manager_uid = KSU_INVALID_UID;
 
 #define KSU_UID_LIST_PATH "/data/misc/user_uid/uid_list"
 #define USER_DATA_PATH "/data/user_de/0"
@@ -157,22 +159,41 @@ static void crown_manager(const char *apk, struct list_head *uid_data, int signa
 		return;
 	}
 #endif
-	struct list_head *list = (struct list_head *)uid_data;
 	struct uid_data *np;
 
-	list_for_each_entry (np, list, list) {
+	list_for_each_entry(np, uid_data, list) {
 		if (strncmp(np->package, pkg, KSU_MAX_PACKAGE_NAME) == 0) {
-			pr_info("Crowning manager: %s(uid=%d, signature_index=%d)\n", pkg, np->uid, signature_index);
-			
-			// Dynamic Sign index (1) or multi-manager signatures (2+)
-			if (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2) {
-				ksu_add_manager(np->uid, signature_index);
-				
-				if (!ksu_is_manager_uid_valid()) {
-					ksu_set_manager_uid(np->uid);
+			bool is_dynamic = (signature_index == DYNAMIC_SIGN_INDEX || signature_index >= 2);
+
+			if (is_dynamic) {
+				if (locked_dynamic_manager_uid != KSU_INVALID_UID && locked_dynamic_manager_uid != np->uid) {
+					pr_info("Unlocking previous dynamic manager UID: %d\n", locked_dynamic_manager_uid);
+					ksu_remove_manager(locked_dynamic_manager_uid);
+					locked_dynamic_manager_uid = KSU_INVALID_UID;
 				}
 			} else {
-				ksu_set_manager_uid(np->uid);
+				if (locked_manager_uid != KSU_INVALID_UID && locked_manager_uid != np->uid) {
+					pr_info("Unlocking previous manager UID: %d\n", locked_manager_uid);
+					ksu_invalidate_manager_uid(); // unlock old one
+					locked_manager_uid = KSU_INVALID_UID;
+				}
+			}
+
+			pr_info("Crowning %s manager: %s (uid=%d, signature_index=%d)\n",
+			        is_dynamic ? "dynamic" : "traditional", pkg, np->uid, signature_index);
+
+			if (is_dynamic) {
+				ksu_add_manager(np->uid, signature_index);
+				locked_dynamic_manager_uid = np->uid;
+
+				// If there is no traditional manager, set it to the current UID
+				if (!ksu_is_manager_uid_valid()) {
+					ksu_set_manager_uid(np->uid);
+					locked_manager_uid = np->uid;
+				}
+			} else {
+				ksu_set_manager_uid(np->uid); // throne new UID
+				locked_manager_uid = np->uid; // store locked UID
 			}
 			break;
 		}
@@ -557,79 +578,76 @@ extern bool ksu_uid_scanner_enabled;
 void track_throne(void)
 {
 	struct list_head uid_list;
+	struct uid_data *np, *n;
 
 	// init uid list head
 	INIT_LIST_HEAD(&uid_list);
 
 	if (ksu_uid_scanner_enabled) {
-    	pr_info("Scanning %s directory..\n", KSU_UID_LIST_PATH);
-
-    	if (uid_from_um_list(&uid_list) == 0) {
-        	pr_info("loaded uids from %s success\n", KSU_UID_LIST_PATH);
-    	} else {
-       		pr_warn("%s read failed, falling back to %s\n", KSU_UID_LIST_PATH, USER_DATA_PATH);
-        	if (scan_user_data_for_uids(&uid_list) < 0)
-            	goto out;
-        	pr_info("UserDE UID: Scanned %zu packages from user data directory\n", list_count_nodes(&uid_list));
-    	}
+		pr_info("Scanning %s directory..\n", KSU_UID_LIST_PATH);
+		if (uid_from_um_list(&uid_list) == 0) {
+			pr_info("Loaded UIDs from %s success\n", KSU_UID_LIST_PATH);
+		} else {
+			pr_warn("%s read failed, falling back to %s\n", KSU_UID_LIST_PATH, USER_DATA_PATH);
+			if (scan_user_data_for_uids(&uid_list) < 0)
+				goto out;
+		}
 	} else {
-		pr_info("User mode scan status is %s, skipping scan %s\n", ksu_uid_scanner_enabled ? "enabled" : "disabled", KSU_UID_LIST_PATH);
+		pr_info("User mode scan disabled, scanning %s\n", USER_DATA_PATH);
 		if (scan_user_data_for_uids(&uid_list) < 0)
 			goto out;
-		pr_info("UserDE UID: Scanned %zu packages from user data directory\n", list_count_nodes(&uid_list));
 	}
 
-	// now update uid list
-	struct uid_data *np;
-	struct uid_data *n;
-
-	// first, check if manager_uid exist!
+	// check if manager UID exists
 	bool manager_exist = false;
-	bool dynamic_manager_exist = false;
-	
-	list_for_each_entry (np, &uid_list, list) {
-		// if manager is installed in work profile, the uid in packages.list is still equals main profile
-		// don't delete it in this case!
-		int manager_uid = ksu_get_manager_uid() % 100000;
-		if (np->uid == manager_uid) {
+	int current_manager_uid = ksu_get_manager_uid() % 100000;
+
+	list_for_each_entry(np, &uid_list, list) {
+		if (np->uid == current_manager_uid) {
 			manager_exist = true;
 			break;
 		}
 	}
-	
-	// Check for dynamic managers
-	if (!dynamic_manager_exist && ksu_is_dynamic_manager_enabled()) {
-		list_for_each_entry (np, &uid_list, list) {
-			// Check if this uid is a dynamic manager (not the traditional manager)
-			if (ksu_is_any_manager(np->uid) && np->uid != ksu_get_manager_uid()) {
+
+	if (!manager_exist && locked_manager_uid != KSU_INVALID_UID) {
+		pr_info("Manager APK removed, unlocking previous UID: %d\n", locked_manager_uid);
+		ksu_invalidate_manager_uid();
+		locked_manager_uid = KSU_INVALID_UID;
+	}
+
+	// Check if the Dynamic Manager exists (only check locked UIDs)
+	bool dynamic_manager_exist = false;
+	if (ksu_is_dynamic_manager_enabled() && locked_dynamic_manager_uid != KSU_INVALID_UID) {
+		list_for_each_entry(np, &uid_list, list) {
+			if (np->uid == locked_dynamic_manager_uid) {
 				dynamic_manager_exist = true;
 				break;
 			}
 		}
+
+		if (!dynamic_manager_exist) {
+			pr_info("Dynamic manager APK removed, unlocking previous UID: %d\n", locked_dynamic_manager_uid);
+			ksu_remove_manager(locked_dynamic_manager_uid);
+			locked_dynamic_manager_uid = KSU_INVALID_UID;
+		}
 	}
 
-	if (!manager_exist) {
-		if (ksu_is_manager_uid_valid()) {
-			pr_info("manager is uninstalled, invalidate it!\n");
-			ksu_invalidate_manager_uid();
-			goto prune;
-		}
-		pr_info("Searching manager...\n");
+	bool need_search = !manager_exist;
+	if (ksu_is_dynamic_manager_enabled() && !dynamic_manager_exist) {
+		need_search = true;
+	}
+
+	if (need_search) {
+		pr_info("Searching for manager(s)...\n");
 		search_manager("/data/app", 2, &uid_list);
-		pr_info("Search manager finished\n");
-	} else if (!dynamic_manager_exist && ksu_is_dynamic_manager_enabled()) {
-		// Always perform search when called from dynamic manager rescan
-		pr_info("Dynamic sign enabled, Searching manager...\n");
-		search_manager("/data/app", 2, &uid_list);
-		pr_info("Search Dynamic sign manager finished\n");
+		pr_info("Manager search finished\n");
 	}
 	
-prune:
 	// then prune the allowlist
 	ksu_prune_allowlist(is_uid_exist, &uid_list);
 out:
 	// free uid_list
-	list_for_each_entry_safe (np, n, &uid_list, list) {
+	list_for_each_entry_safe(np, n, &uid_list, list) {
 		list_del(&np->list);
 		kfree(np);
 	}
