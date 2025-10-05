@@ -1774,7 +1774,7 @@ int ksu_bprm_check(struct linux_binprm *bprm)
 
 }
 
-#ifdef CONFIG_KSU_MANUAL_SU
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0) && defined(CONFIG_KSU_MANUAL_SU)
 static int ksu_task_alloc(struct task_struct *task,
                           unsigned long clone_flags)
 {
@@ -1801,8 +1801,8 @@ static struct security_hook_list ksu_hooks[] = {
 	LSM_HOOK_INIT(inode_rename, ksu_inode_rename),
 	LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),
 	LSM_HOOK_INIT(inode_permission, ksu_inode_permission),
-#ifdef CONFIG_KSU_MANUAL_SU
-	LSM_HOOK_INIT(task_alloc, ksu_task_alloc),
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0) && defined(CONFIG_KSU_MANUAL_SU)
+    LSM_HOOK_INIT(task_alloc, ksu_task_alloc),
 #endif
 #ifndef CONFIG_KSU_KPROBES_HOOK
 	LSM_HOOK_INIT(bprm_check_security, ksu_bprm_check),
