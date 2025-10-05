@@ -482,6 +482,7 @@ static bool is_system_bin_su()
 	return (current->mm->exe_file && !strcmp(current->mm->exe_file->f_path.dentry->d_name.name, "su"));
 }
 
+#ifdef CONFIG_KSU_MANUAL_SU
 static bool is_system_uid(void)
 {
 	if (!current->mm || current->in_execve) {
@@ -491,6 +492,7 @@ static bool is_system_uid(void)
 	uid_t caller_uid = current_uid().val;
 	return caller_uid <= 2000;
 }
+#endif
 
 static void init_uid_scanner(void)
 {
@@ -512,15 +514,20 @@ int ksu_handle_prctl(int option, unsigned long arg2, unsigned long arg3,
 #ifdef CONFIG_KSU_SUSFS
 	// - We straight up check if process is supposed to be umounted, return 0 if so
 	// - This is to prevent side channel attack as much as possible
+#ifdef CONFIG_KSU_MANUAL_SU
 	bool is_manual_su_cmd = (arg2 == CMD_SU_ESCALATION_REQUEST ||
 	                         arg2 == CMD_ADD_PENDING_ROOT);
 	if (is_manual_su_cmd) {
 		if (!is_system_uid())
-			return -EPERM;
+			return 0;
 	} else {
 		if (likely(susfs_is_current_proc_umounted()))
 			return 0;
 	}
+#else
+	if (likely(susfs_is_current_proc_umounted()))
+		return 0;
+#endif
 #endif
 
 	// if success, we modify the arg5 as result!
